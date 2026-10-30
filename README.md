@@ -65,6 +65,7 @@ moyu-reader/
 ├─ moyu_reader.py      主程序，单文件，唯一入口
 ├─ split_novel.py      辅助工具：把大 TXT 按 2MB 拆成多份
 ├─ start_reader.bat    启动器：无控制台窗口
+├─ LICENSE             MIT 许可证
 ├─ .gitignore
 ├─ books/              书籍目录，放 *.txt 即出现在书架（内容不入库）
 ├─ config.json         UI 配置，运行时自动生成
@@ -94,4 +95,4 @@ moyu-reader/
 
 ## License
 
-尚未选择许可证。若要公开发布，建议补一个 `LICENSE` 文件（如 MIT）。
+[MIT](LICENSE) © 2026 chenmc729
