@@ -2,6 +2,7 @@
 config.json
 progress.json
 error.log
+reader.log
 
 # ---- 书籍内容（受版权保护，体积大）----
 books/*.txt

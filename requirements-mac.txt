@@ -1,0 +1,14 @@
+# macOS 依赖
+# 安装：pip3 install -r requirements-mac.txt
+#
+# pyobjc-core                 objc 运行时（调用 Cocoa 的桥）
+# pyobjc-framework-Cocoa      AppKit / Foundation（窗口、菜单栏图标、NSEvent、NSScreen）
+# pyobjc-framework-Quartz     Quartz（pynput 在 macOS 上依赖它做事件监听）
+# pyobjc-framework-ApplicationServices  AXIsProcessTrusted（检查辅助功能授权）
+# pynput                      全局热键（GlobalHotKeys）
+
+pyobjc-core>=10.0
+pyobjc-framework-Cocoa>=9.0
+pyobjc-framework-Quartz>=4.0
+pyobjc-framework-ApplicationServices>=4.1
+pynput>=1.7

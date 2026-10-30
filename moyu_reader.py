@@ -2,7 +2,7 @@
 """
 摸鱼小说阅读器 MoYu Reader
 ================================
-一个轻量、透明的悬浮小说阅读器（Windows）。
+一个轻量、透明的悬浮小说阅读器（Windows / macOS 双平台）。
 
 特点：
 - 透明悬浮：文字浮在桌面上，背景完全透明且点击穿透
@@ -15,7 +15,14 @@
 - 大文件无压力：仅在打开时解码一次，翻页是纯内存切片
 
 用法：
-    pythonw moyu_reader.py
+    pythonw moyu_reader.py          # Windows
+    python3 moyu_reader.py          # macOS
+
+文件划分：
+    moyu_core.py        平台无关：编码识别、章节解析、配置与进度
+    moyu_backend.py     平台后端入口 + Windows 实现（Win32 热键 / 托盘）
+    moyu_backend_mac.py macOS 实现（pynput 热键 / NSStatusItem / 透明穿透）
+    moyu_reader.py      Tk 界面（两端共用）
 
 快捷键（默认）：
     Alt+Z  上一页
@@ -27,11 +34,7 @@
 
 书本目录：与脚本同目录的 books/ 文件夹，放入 .txt 即可。
 """
-import ctypes
-import ctypes.wintypes as wt
-import json
 import os
-import re
 import shutil
 import sys
 import threading
@@ -40,175 +43,14 @@ import tkinter as tk
 from tkinter import ttk, filedialog
 import tkinter.font as tkfont
 
-# ---------------- Windows API ----------------
-user32 = ctypes.windll.user32
-kernel32 = ctypes.windll.kernel32
-shell32 = ctypes.windll.shell32
-
-MOD_ALT = 0x0001
-MOD_CONTROL = 0x0002
-MOD_SHIFT = 0x0004
-WM_HOTKEY = 0x0312
-VK_Z, VK_C, VK_V = 0x5A, 0x43, 0x56
-VK_B, VK_S, VK_G = 0x42, 0x53, 0x47
-VK_D = 0x44
-
-# 托盘相关常量
-WM_USER = 0x0400
-WM_TRAYICON = WM_USER + 20
-WM_RBUTTONUP = 0x0205
-WM_LBUTTONUP = 0x0202
-NIM_ADD, NIM_MODIFY, NIM_DELETE = 0, 1, 2
-NIF_MESSAGE, NIF_ICON, NIF_TIP = 0x1, 0x2, 0x4
-IDI_APPLICATION = 32512
-
-
-class NOTIFYICONDATAW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wt.DWORD),
-        ("hWnd", wt.HWND),
-        ("uID", wt.UINT),
-        ("uFlags", wt.UINT),
-        ("uCallbackMessage", wt.UINT),
-        ("hIcon", wt.HICON),
-        ("szTip", ctypes.c_wchar * 128),
-        ("dwState", wt.DWORD),
-        ("dwStateMask", wt.DWORD),
-        ("szInfo", ctypes.c_wchar * 256),
-        ("uTimeout", wt.UINT),
-        ("szInfoTitle", ctypes.c_wchar * 179),
-        ("dwInfoFlags", wt.DWORD),
-        ("guidItem", ctypes.c_byte * 16),
-        ("hBalloonIcon", wt.HICON),
-    ]
-
-
-WNDPROC = ctypes.WINFUNCTYPE(ctypes.c_ssize_t, wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM)
-
-
-class WNDCLASSEXW(ctypes.Structure):
-    _fields_ = [
-        ("cbSize", wt.UINT),
-        ("style", wt.UINT),
-        ("lpfnWndProc", WNDPROC),
-        ("cbClsExtra", ctypes.c_int),
-        ("cbWndExtra", ctypes.c_int),
-        ("hInstance", wt.HINSTANCE),
-        ("hIcon", wt.HICON),
-        ("hCursor", wt.HANDLE),
-        ("hbrBackground", wt.HBRUSH),
-        ("lpszMenuName", wt.LPCWSTR),
-        ("lpszClassName", wt.LPCWSTR),
-        ("hIconSm", wt.HICON),
-    ]
-
-
-user32.LoadIconW.restype = wt.HICON
-# 注意：LoadIconW 第二参可以是整数资源 ID（IDI_APPLICATION），不能声明为 LPCWSTR
-user32.CreateWindowExW.restype = wt.HWND
-user32.CreateWindowExW.argtypes = [wt.DWORD, wt.LPCWSTR, wt.LPCWSTR, wt.DWORD,
-                                   ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-                                   wt.HWND, wt.HMENU, wt.HINSTANCE, wt.LPVOID]
-user32.DefWindowProcW.restype = ctypes.c_ssize_t
-user32.DefWindowProcW.argtypes = [wt.HWND, wt.UINT, wt.WPARAM, wt.LPARAM]
-user32.RegisterClassExW.argtypes = [ctypes.c_void_p]
-user32.CreatePopupMenu.restype = wt.HMENU
-user32.DestroyMenu.argtypes = [wt.HMENU]
-user32.AppendMenuW.restype = ctypes.c_int
-user32.AppendMenuW.argtypes = [wt.HMENU, wt.UINT, ctypes.c_size_t, wt.LPCWSTR]
-user32.TrackPopupMenu.restype = ctypes.c_int
-user32.TrackPopupMenu.argtypes = [wt.HMENU, wt.UINT, ctypes.c_int, ctypes.c_int,
-                                  ctypes.c_int, wt.HWND, ctypes.c_void_p]
-user32.GetCursorPos.argtypes = [ctypes.c_void_p]
-user32.SetForegroundWindow.argtypes = [wt.HWND]
-kernel32.GetModuleHandleW.restype = wt.HMODULE
-kernel32.GetModuleHandleW.argtypes = [wt.LPCWSTR]
-
-class POINT(ctypes.Structure):
-    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
-
-APP_DIR = os.path.dirname(os.path.abspath(__file__))
-BOOKS_DIR = os.path.join(APP_DIR, "books")
-CONFIG_PATH = os.path.join(APP_DIR, "config.json")
-PROGRESS_PATH = os.path.join(APP_DIR, "progress.json")
+from moyu_core import (APP_DIR, BOOKS_DIR, CONFIG_PATH, PROGRESS_PATH,
+                       DEFAULT_CONFIG, DEFAULT_FONT, HOTKEYS, IS_MAC, IS_WIN,
+                       detect_encoding, parse_chapters, load_config, save_config,
+                       load_progress, save_progress, font_choices, resolve_font,
+                       open_folder)
+from moyu_backend import create_backend
 
 MAGIC_BG = "#010203"   # 透明魔术色：此颜色的像素完全透明且点击穿透
-
-DEFAULT_CONFIG = {
-    "font_family": "Microsoft YaHei UI",
-    "font_size": 16,
-    "text_color": "#ffffff",
-    "letter_spacing": 2,
-    "line_spacing": 12,
-    "words_per_page": 80,
-    "auto_hide_delay": 2,
-    "win_width": 800,
-    "win_height": 60,
-    "text_offset_x": 8,
-    "text_offset_y": 4,
-}
-
-
-def detect_encoding(raw: bytes):
-    if raw[:3] == b"\xef\xbb\xbf":
-        return "utf-8-sig"
-    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
-        return "utf-16"
-    # 优先按 UTF-8 解码并统计坏字节比例：<0.1% 视为 UTF-8，否则回退 GB18030
-    try:
-        text = raw.decode("utf-8", errors="replace")
-        bad_ratio = text.count("\ufffd") / max(len(text), 1)
-        if bad_ratio < 0.001:
-            return "utf-8"
-    except Exception:
-        pass
-    try:
-        raw.decode("gb18030")
-        return "gb18030"
-    except UnicodeDecodeError:
-        return "utf-8"
-
-
-CN_NUM = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
-          "六": 6, "七": 7, "八": 8, "九": 9, "十": 10, "百": 100, "千": 1000}
-
-
-def cn_to_int(s: str) -> int:
-    """中文数字转整数：一→1 十一→11 二十三→23 一百零五→105"""
-    total, num = 0, 0
-    for ch in s:
-        v = CN_NUM.get(ch, 0)
-        if v >= 10:
-            total += num * v if num > 0 else v
-            num = 0
-        else:
-            num = v
-    return total + num
-
-
-def chapter_no(num_str: str):
-    """章节数字统一转 int，阿拉伯和中文数字归一化"""
-    if num_str.isdigit():
-        return int(num_str)
-    return cn_to_int(num_str)
-
-
-def parse_chapters(text: str):
-    """返回 [(标题, 起始字符偏移), ...]；合并同一章的相邻重复（目录行+正文标题）"""
-    pattern = re.compile(
-        r"^\s*第\s*([0-9]+|[一二三四五六七八九十百千零两]+)\s*([章回节卷集部])([^\n]{0,40})?\s*$",
-        re.MULTILINE)
-    chapters = []
-    prev_no = None
-    for m in pattern.finditer(text):
-        no = chapter_no(m.group(1))
-        if no == prev_no:
-            continue  # 与上一章同号：视为目录/正文重复，跳过
-        prev_no = no
-        kind = m.group(2)
-        title = (m.group(3) or "").strip()
-        chapters.append((f"第{no}{kind} {title}".strip(), m.start()))
-    return chapters
 
 
 class MoYuReader:
@@ -231,11 +73,15 @@ class MoYuReader:
         self._last_activity = time.time()  # 最近一次阅读活动（翻页等）
         self.indicator = None  # 自动隐藏后留下的指示小点
         self.move_mode = False  # 位置调整模式（Alt+D 切换）
-        self._tray_hwnd = None
-        self._nid = None
-        self._tray_menu = None
-        self._tray_wndproc_ref = None
-        self._menu_close_time = 0.0  # 托盘菜单关闭时刻，用于防误触
+
+        # 平台后端：热键 / 托盘 / 光标 / 工作区 / 透明
+        self.backend = create_backend(on_action=self._dispatch_action,
+                                      on_log=self._log_err)
+        # 心跳间隔：Windows 500ms 够用；macOS 需要更短，点击穿透才跟手
+        self._tick_ms = 100 if IS_MAC else 500
+        self._last_tick = time.time()
+        self._tick_id = None
+        self.ui_font = resolve_font(DEFAULT_FONT)  # 界面控件字体
 
         self._build_reader_window()
         self._build_panels()
@@ -252,42 +98,26 @@ class MoYuReader:
 
     # ---------- 配置/进度 ----------
     def _load_config(self):
-        cfg = dict(DEFAULT_CONFIG)
-        try:
-            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
-                cfg.update(json.load(f))
-        except Exception:
-            pass
-        return cfg
+        return load_config(CONFIG_PATH)
 
     def _save_config(self):
-        try:
-            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        save_config(self.config, CONFIG_PATH)
 
     def _load_progress(self):
-        try:
-            with open(PROGRESS_PATH, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        return load_progress(PROGRESS_PATH)
 
     def _save_progress(self):
-        try:
-            with open(PROGRESS_PATH, "w", encoding="utf-8") as f:
-                json.dump(self.progress, f, ensure_ascii=False, indent=2)
-        except Exception:
-            pass
+        save_progress(self.progress, PROGRESS_PATH)
 
     # ---------- 阅读窗 ----------
     def _build_reader_window(self):
+        token = self.backend.begin_window()
         w = tk.Toplevel(self.root)
         w.overrideredirect(True)
-        w.attributes("-topmost", True)
-        w.attributes("-transparentcolor", MAGIC_BG)
-        w.configure(bg=MAGIC_BG)
+        # 先关联原生窗口（macOS 透明/穿透要用），再设置顶与透明
+        self.backend.bind_window(w, token)
+        self.backend.set_topmost(w, True)
+        self.backend.make_transparent(w, MAGIC_BG)
         ww = self.config["win_width"]
         wh = self.config["win_height"]
         wx = self.config.get("win_x", int((w.winfo_screenwidth() - ww) / 2))
@@ -297,7 +127,7 @@ class MoYuReader:
         self.read_win = w
 
         self.font_obj = tkfont.Font(
-            family=self.config["font_family"],
+            family=resolve_font(self.config["font_family"]),
             size=self.config["font_size"],
         )
 
@@ -326,7 +156,7 @@ class MoYuReader:
             b = tk.Button(bar, text=text, command=(lambda c=cmd, a=args: c(*a)),
                           bg=MAGIC_BG, fg="#888888", bd=0, relief="flat",
                           activebackground=MAGIC_BG, activeforeground="#ffffff",
-                          cursor="hand2", font=("Microsoft YaHei UI", 9))
+                          cursor="hand2", font=(self.ui_font, 9))
             b.pack(side="left", padx=4)
         self.toolbar = bar
 
@@ -355,7 +185,7 @@ class MoYuReader:
 
     def _apply_style(self):
         self.font_obj.configure(
-            family=self.config["font_family"],
+            family=resolve_font(self.config["font_family"]),
             size=self.config["font_size"],
         )
         self.label.configure(
@@ -432,7 +262,7 @@ class MoYuReader:
 
     def _open_books_dir(self):
         os.makedirs(BOOKS_DIR, exist_ok=True)
-        os.startfile(BOOKS_DIR)
+        open_folder(BOOKS_DIR)
 
     def show_chapters(self):
         if self.book_name is None or not self.chapters:
@@ -446,7 +276,7 @@ class MoYuReader:
         win.attributes("-topmost", True)
         self.chapter_win = win
 
-        lb = tk.Listbox(win, font=("Microsoft YaHei UI", 10))
+        lb = tk.Listbox(win, font=(self.ui_font, 10))
         lb.pack(fill="both", expand=True, padx=6, pady=6)
         current = 0
         for i, (title, off) in enumerate(self.chapters):
@@ -490,13 +320,9 @@ class MoYuReader:
         pad = {"padx": 10, "pady": 4}
 
         # 字体选择
-        tk.Label(win, text="字体：", font=("Microsoft YaHei UI", 10)).pack(anchor="w", **pad)
+        tk.Label(win, text="字体：", font=(self.ui_font, 10)).pack(anchor="w", **pad)
         font_var = tk.StringVar(value=c["font_family"])
-        fonts = ["微软雅黑", "微软雅黑 UI", "黑体", "宋体", "楷体", "仿宋",
-                 "华文行楷", "华文楷体", "华文隶书", "华文新魏", "方正舒体", "幼圆",
-                 "Consolas", "Courier New"]
-        avail = set(tkfont.families())
-        fonts = [f for f in fonts if f in avail or f == "微软雅黑 UI"]
+        fonts = font_choices()
         cb = ttk.Combobox(win, textvariable=font_var, values=fonts, state="readonly")
         cb.pack(fill="x", **pad)
         cb.bind("<<ComboboxSelected>>", lambda e: (
@@ -522,7 +348,7 @@ class MoYuReader:
                  variable=var_wh,
                  command=set_key("win_height", var_wh, True)).pack(fill="x", **pad)
 
-        tk.Label(win, text="文字颜色：", font=("Microsoft YaHei UI", 10)).pack(anchor="w", **pad)
+        tk.Label(win, text="文字颜色：", font=(self.ui_font, 10)).pack(anchor="w", **pad)
         colors = ["#ffffff", "#ffff00", "#00ff00", "#ff8800", "#ff00ff", "#00ffff", "#aaaaaa"]
         frm = tk.Frame(win)
         frm.pack(**pad)
@@ -538,7 +364,7 @@ class MoYuReader:
 
         tk.Label(win, text="快捷键：Alt+Z 上一页 | Alt+C 下一页 | Alt+V 老板键 | "
                            "Alt+B 书架 | Alt+G 章节 | Alt+S 设置 | Alt+D 位置调整",
-                 font=("Microsoft YaHei UI", 9), fg="#666666",
+                 font=(self.ui_font, 9), fg="#666666",
                  justify="left", wraplength=320, anchor="w").pack(fill="x", **pad)
 
     # ---------- 阅读 ----------
@@ -664,17 +490,16 @@ class MoYuReader:
         y = e.y_root - self._drag_off[1]
         w = self.read_win.winfo_width()
         h = self.read_win.winfo_height()
-        # 使用工作区（避开任务栏）
-        wa_w = user32.GetSystemMetrics(61)   # SM_CXWORKAREA
-        wa_h = user32.GetSystemMetrics(62)   # SM_CYWORKAREA
-        if abs(x) < SNAP:
-            x = 0
-        elif abs(wa_w - (x + w)) < SNAP:
-            x = wa_w - w
-        if abs(y) < SNAP:
-            y = 0
-        elif abs(wa_h - (y + h)) < SNAP:
-            y = wa_h - h
+        # 使用工作区（避开任务栏 / Dock）
+        wa_x, wa_y, wa_w, wa_h = self.backend.work_area()
+        if abs(x - wa_x) < SNAP:
+            x = wa_x
+        elif abs((wa_x + wa_w) - (x + w)) < SNAP:
+            x = wa_x + wa_w - w
+        if abs(y - wa_y) < SNAP:
+            y = wa_y
+        elif abs((wa_y + wa_h) - (y + h)) < SNAP:
+            y = wa_y + wa_h - h
         self.read_win.geometry(f"+{x}+{y}")
 
     def _on_drag_end(self, _=None):
@@ -716,7 +541,9 @@ class MoYuReader:
 
     # ---------- 线程 ----------
     def _start_threads(self):
-        threading.Thread(target=self._hotkey_loop, daemon=True).start()
+        self.backend.start()
+        # 托盘（Windows）/ 菜单栏图标（macOS）必须在 UI 线程创建
+        self.backend.create_tray(APP_DIR)
         # 自动隐藏用主线程轮询（tkinter 非线程安全）
         self._auto_hide_tick()
 
@@ -730,68 +557,71 @@ class MoYuReader:
         if not self._running:
             return
         try:
+            now = time.time()
             if self.read_win.winfo_viewable():
                 # 面板打开时不自动隐藏；显示后 3 秒宽限期内也不隐藏（防瞬隐）
-                if self._any_panel_open() or time.time() - self._show_time < 3:
+                if self._any_panel_open() or now - self._show_time < 3:
                     self._away_time = 0.0
                 else:
-                    pt = POINT()
-                    user32.GetCursorPos(ctypes.byref(pt))
+                    pt_x, pt_y = self.backend.cursor_pos()
                     rx = self.read_win.winfo_x()
                     ry = self.read_win.winfo_y()
                     rw = self.read_win.winfo_width()
                     rh = self.read_win.winfo_height()
-                    inside = rx <= pt.x <= rx + rw and ry <= pt.y <= ry + rh
+                    inside = rx <= pt_x <= rx + rw and ry <= pt_y <= ry + rh
                     if inside:
                         # 光标在文字上：永不隐藏
                         self._away_time = 0.0
-                    elif time.time() - self._last_activity < self.config["auto_hide_delay"]:
+                    elif now - self._last_activity < self.config["auto_hide_delay"]:
                         # 刚翻过页（在设定的隐藏时间内）：暂不隐藏，重新计时
                         self._away_time = 0.0
                     else:
-                        self._away_time += 0.5
+                        # 累计真实经过时间（macOS 心跳更短，不能写死 0.5）
+                        self._away_time += max(0.0, now - self._last_tick)
                         if self._away_time >= self.config["auto_hide_delay"]:
                             self.hide_reader(by_auto=True)
             else:
                 self._away_time = 0.0
+            # macOS：按光标位置动态切换点击穿透
+            if IS_MAC:
+                self._update_click_through()
+            # 后端（热键线程）排队的动作，统一在这里转到 UI 线程执行
+            for name in self.backend.poll_actions():
+                self._dispatch_action(name)
         except Exception:
             pass
-        self.root.after(500, self._auto_hide_tick)
-
-    def _hotkey_loop(self):
+        self._last_tick = time.time()
         try:
-            self._create_tray_window()  # 托盘窗口挂在热键线程，消息循环一起处理
-        except Exception as e:
-            self._log_err(f"tray create failed: {e!r}")
-        user32.RegisterHotKey(None, 1, MOD_ALT, VK_Z)   # 上一页
-        user32.RegisterHotKey(None, 2, MOD_ALT, VK_C)   # 下一页
-        user32.RegisterHotKey(None, 3, MOD_ALT, VK_V)   # 老板键
-        user32.RegisterHotKey(None, 4, MOD_ALT, VK_B)   # 书架
-        user32.RegisterHotKey(None, 5, MOD_ALT, VK_G)   # 章节
-        user32.RegisterHotKey(None, 6, MOD_ALT, VK_S)   # 设置
-        user32.RegisterHotKey(None, 7, MOD_ALT, VK_D)   # 位置调整模式
-        msg = wt.MSG()
-        while self._running:
-            if user32.GetMessageW(ctypes.byref(msg), None, 0, 0) <= 0:
-                break
-            if msg.message == WM_HOTKEY:
-                self._on_hotkey(msg.wParam)
-            user32.TranslateMessage(ctypes.byref(msg))
-            user32.DispatchMessageW(ctypes.byref(msg))
+            self._tick_id = self.root.after(self._tick_ms, self._auto_hide_tick)
+        except Exception:
+            pass
 
-    def _on_hotkey(self, hk_id):
+    def _update_click_through(self):
+        """macOS 专用：光标在文字/工具条上时可交互，否则穿透到下层应用。"""
+        rx = self.read_win.winfo_x()
+        ry = self.read_win.winfo_y()
+        rects = [(rx, ry, self.read_win.winfo_width(), self.read_win.winfo_height())]
+        self.backend.update_click_through(self.read_win, rects)
+
+    def _dispatch_action(self, name):
+        """后端回调（热键 / 托盘菜单）：统一切到 UI 线程执行。"""
         actions = {
-            1: lambda: self.turn_page(False),
-            2: lambda: self.turn_page(True),
-            3: self.toggle_boss,
-            4: self.show_bookshelf,
-            5: self.show_chapters,
-            6: self.show_settings,
-            7: self.toggle_move_mode,
+            "prev": lambda: self.turn_page(False),
+            "next": lambda: self.turn_page(True),
+            "boss": self.toggle_boss,
+            "books": self.show_bookshelf,
+            "chapters": self.show_chapters,
+            "settings": self.show_settings,
+            "move": self.toggle_move_mode,
+            "quit": self.quit_app,
         }
-        act = actions.get(hk_id)
-        if act:
+        act = actions.get(name)
+        if act is None:
+            return
+        try:
             self.root.after(0, act)
+        except Exception:
+            pass
 
     def _log_err(self, msg):
         try:
@@ -800,102 +630,18 @@ class MoYuReader:
         except Exception:
             pass
 
-    # ---------- 系统托盘 ----------
-    def _create_tray_window(self):
-        wc = WNDCLASSEXW()
-        wc.cbSize = ctypes.sizeof(WNDCLASSEXW)
-        wc.lpfnWndProc = self._tray_wndproc_ref = WNDPROC(self._tray_wndproc)
-        wc.hInstance = kernel32.GetModuleHandleW(None)
-        wc.lpszClassName = "MoYuTrayWnd"
-        user32.RegisterClassExW(ctypes.byref(wc))
-        self._tray_hwnd = user32.CreateWindowExW(
-            0, "MoYuTrayWnd", "", 0, 0, 0, 0, 0,
-            None, None, wc.hInstance, None)
-        self._add_tray_icon()
-
-    def _add_tray_icon(self):
-        nid = NOTIFYICONDATAW()
-        nid.cbSize = ctypes.sizeof(NOTIFYICONDATAW)
-        nid.hWnd = self._tray_hwnd
-        nid.uID = 1
-        nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP
-        nid.uCallbackMessage = WM_TRAYICON
-        nid.hIcon = user32.LoadIconW(None, IDI_APPLICATION)
-        nid.szTip = "摸鱼阅读器"
-        self._nid = nid
-        shell32.Shell_NotifyIconW(NIM_ADD, ctypes.byref(nid))
-
-    def _remove_tray_icon(self):
-        if self._nid is not None:
-            shell32.Shell_NotifyIconW(NIM_DELETE, ctypes.byref(self._nid))
-            self._nid = None
-
-    def _tray_wndproc(self, hwnd, msg, wp, lp):
-        if msg == WM_TRAYICON:
-            action = lp & 0xFFFF
-            if action == WM_RBUTTONUP:
-                # 直接在本线程（热键线程）同步弹菜单，避免与 Tk 主循环冲突
-                pt = POINT()
-                user32.GetCursorPos(ctypes.byref(pt))
-                try:
-                    self._show_tray_menu(pt.x, pt.y)
-                except Exception as e:
-                    self._log_err(f"tray menu failed: {e!r}")
-            elif action == WM_LBUTTONUP:
-                # 防误触：菜单刚关闭时，忽略松键（防止选中菜单项后残留的左键松开触发切换）
-                if time.time() - self._menu_close_time < 0.4:
-                    self._log_err(f"WM_LBUTTONUP ignored (menu just closed, "
-                                  f"dt={time.time()-self._menu_close_time:.2f}s)")
-                    return user32.DefWindowProcW(hwnd, msg, wp, lp)
-                self._log_err("WM_LBUTTONUP -> toggle_boss")
-                self.root.after(0, self.toggle_boss)
-        return user32.DefWindowProcW(hwnd, msg, wp, lp)
-
-    def _show_tray_menu(self, x, y):
-        """Win32 原生弹出菜单：定位准确、点击外部自动关闭、同步阻塞"""
-        MF_STRING, MF_SEPARATOR = 0x0, 0x800
-        TPM_RIGHTBUTTON, TPM_RETURNCMD = 0x2, 0x0100
-        items = [
-            (1, "显示/隐藏阅读窗", self.toggle_boss),
-            (2, "书架", self.show_bookshelf),
-            (3, "设置", self.show_settings),
-            (None, None, None),          # 分隔线
-            (4, "退出", self.quit_app),
-        ]
-        hmenu = user32.CreatePopupMenu()
-        for i, label, _ in items:
-            if label is None:
-                user32.AppendMenuW(hmenu, MF_SEPARATOR, 0, None)
-            else:
-                user32.AppendMenuW(hmenu, MF_STRING, i, label)
-        # 同步阻塞直到菜单关闭；返回选中的命令 id（0=未选择/被点击外部关闭）
-        # 先设为前台窗口，否则后台线程弹的菜单无法正常激活（点击外部不会关闭）
-        user32.SetForegroundWindow(self._tray_hwnd)
-        cmd = user32.TrackPopupMenu(hmenu, TPM_RIGHTBUTTON | TPM_RETURNCMD,
-                                    x, y, 0, self._tray_hwnd, None)
-        user32.DestroyMenu(hmenu)
-        self._menu_close_time = time.time()  # 记录关闭时刻，防误触
-        self._log_err(f"menu closed, cmd={cmd}")
-        dispatched = False
-        for i, _, fn in items:
-            if i is not None and cmd == i:
-                self._log_err(f"dispatch item {i}: {getattr(fn, '__name__', fn)}")
-                dispatched = True
-                try:
-                    self.root.after(0, fn)
-                except Exception as e:
-                    self._log_err(f"dispatch failed: {e!r}")
-        if not dispatched:
-            self._log_err("no item matched (cmd=0 or unknown)")
-
     def quit_app(self):
         self._running = False
-        self._remove_tray_icon()
-        for i in range(1, 8):
-            try:
-                user32.UnregisterHotKey(None, i)
-            except Exception:
-                pass
+        try:
+            if getattr(self, "_tick_id", None):
+                self.root.after_cancel(self._tick_id)
+                self._tick_id = None
+        except Exception:
+            pass
+        try:
+            self.backend.stop()
+        except Exception:
+            pass
         self.root.destroy()
 
 
