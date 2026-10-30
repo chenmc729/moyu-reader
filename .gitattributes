@@ -1,0 +1,10 @@
+# 默认按文本处理，提交时统一为 LF
+* text=auto
+
+*.py   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf
+*.txt  text eol=lf
+
+# 批处理必须是 CRLF，否则在部分 Windows 上会出问题
+*.bat  text eol=crlf

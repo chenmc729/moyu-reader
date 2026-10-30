@@ -1,0 +1,29 @@
+# ---- 运行时自动生成，不入库 ----
+config.json
+progress.json
+error.log
+
+# ---- 书籍内容（受版权保护，体积大）----
+books/*.txt
+!books/.gitkeep
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+
+# ---- 编辑器 / IDE ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 系统 ----
+Thumbs.db
+desktop.ini
+.DS_Store
+$RECYCLE.BIN/
